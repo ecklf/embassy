@@ -19,9 +19,8 @@ use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::Timer;
 use embedded_graphics::{
-    pixelcolor::BinaryColor::On as Black,
     prelude::*,
-    primitives::{Line, PrimitiveStyle},
+    primitives::{Line, PrimitiveStyle, Triangle},
 };
 
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
@@ -92,17 +91,43 @@ async fn main(_spawner: Spawner) {
     let mut spi_dev = SpiDevice::new(&spi_bus, cs);
     let mut epd3in7 = EPD3in7::new(&mut spi_dev, busy_in, dc, rst, &mut delay, None).unwrap();
     let mut display = Display3in7::default();
+    display.set_rotation(DisplayRotation::Rotate90);
 
     // Build the style
     let style = MonoTextStyleBuilder::new()
-        .font(&embedded_graphics::mono_font::ascii::FONT_6X10)
+        .font(&embedded_graphics::mono_font::ascii::FONT_7X14)
         .text_color(Color::White)
         .background_color(Color::Black)
         .build();
-    let text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
+    let text_style = TextStyleBuilder::new()
+        .baseline(Baseline::Top)
+        .alignment(embedded_graphics::text::Alignment::Center)
+        .build();
 
-    // Draw some text at a certain point using the specified text style
-    let _ = Text::with_text_style("It's working-WoB!", Point::new(175, 250), style, text_style).draw(&mut display);
+    // Draw Vercel triangle in center
+    let triangle_width = 40;
+    let triangle_height = 32;
+
+    let center_x = 240; // 3.7" display is 480x280, so center is around 240
+    let center_y = 140 - (triangle_height / 2); // Adjusting for text height
+
+    let triangle = Triangle::new(
+        Point::new(center_x, center_y - triangle_height), // Top point
+        Point::new(center_x - triangle_width, center_y + triangle_height), // Bottom left
+        Point::new(center_x + triangle_width, center_y + triangle_height), // Bottom right
+    )
+    .into_styled(PrimitiveStyle::with_fill(Color::White));
+
+    let _ = triangle.draw(&mut display);
+
+    // Draw "Hello from Rust" below the triangle
+    let _ = Text::with_text_style(
+        "Hello from Rust",
+        Point::new(center_x, center_y + triangle_height + 20),
+        style,
+        text_style,
+    )
+    .draw(&mut display);
 
     // Show display on e-paper
     epd3in7

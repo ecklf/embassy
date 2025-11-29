@@ -25,6 +25,8 @@ defmt-rtt = "1.0.0"
 fixed = "1.23.1"
 fixed-macro = "1.2"
 
+
+reqwless = { version = "0.13.0", features = ["defmt"] }
 serde = { version = "1.0.203", default-features = false, features = ["derive"] }
 serde-json-core = "0.5.1"
 

@@ -165,7 +165,6 @@ async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) ->
             // No data available
         }
     }
-
     parsed_response
 }
 

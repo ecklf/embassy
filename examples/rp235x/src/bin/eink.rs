@@ -33,11 +33,9 @@ use heapless;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 
-
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-
 
 use embassy_rp::spi;
 use embassy_rp::spi::Spi;
@@ -62,8 +60,6 @@ async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'stat
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
 }
-
-
 
 // Program metadata for `picotool info`.
 // This isn't needed, but it's recomended to have these minimal entries.
@@ -183,14 +179,15 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    // E-ink display setup - using different DMA channels
-    let epd_rst_pin = p.PIN_14; // Reset pin (moved from PIN_12)
-    let epd_dc_pin = p.PIN_15; // Data/Command pin (moved from PIN_8 to avoid conflict)
+    // E-ink display setup - using SPI1 with original pins
+    // Note: PIO SPI for WiFi is independent from hardware SPI1
+    let epd_rst_pin = p.PIN_12; // Reset pin
+    let epd_dc_pin = p.PIN_8; // Data/Command pin
     let epd_busy_pin = p.PIN_13; // Busy status pin
     let epd_cs_pin = p.PIN_9; // SPI Chip Select pin
     let epd_clk_pin = p.PIN_10; // SPI Clock pin
     let epd_mosi_pin = p.PIN_11; // SPI Master Out Slave In pin
-    let epd_miso_pin_dummy = p.PIN_28; // SPI Master In Slave Out pin (valid MISO pin for SPI1)
+    let epd_miso_pin_dummy = p.PIN_28; // SPI Master In Slave Out pin
 
     let cs_epd = Output::new(epd_cs_pin, Level::High);
     let rst = Output::new(epd_rst_pin, Level::Low);

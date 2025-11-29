@@ -29,7 +29,6 @@ use embedded_graphics::{
     prelude::*,
     primitives::{PrimitiveStyle, Triangle},
 };
-use heapless;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 
@@ -129,11 +128,6 @@ async fn main(spawner: Spawner) {
         .alignment(embedded_graphics::text::Alignment::Left)
         .build();
 
-    let _ = Text::with_text_style("Connecting to WiFi...", Point::new(20, 20), style, text_style).draw(&mut display);
-    epd3in7
-        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
-        .expect("display error");
-
     // WiFi setup
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs_wifi = Output::new(p.PIN_25, Level::High);
@@ -141,6 +135,8 @@ async fn main(spawner: Spawner) {
     let pio_spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        // SPI communication won't work if the speed is too high, so we use a divider larger than `DEFAULT_CLOCK_DIVIDER`.
+        // See: https://github.com/embassy-rs/embassy/issues/3960.
         RM2_CLOCK_DIVIDER,
         pio.irq0,
         cs_wifi,
@@ -149,27 +145,17 @@ async fn main(spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    let _ = Text::with_text_style("Setup completed...", Point::new(20, 20), style, text_style).draw(&mut display);
-    epd3in7
-        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
-        .expect("display error");
-
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, pio_spi, fw).await;
     spawner.spawn(unwrap!(cyw43_task(runner)));
-
-    let _ = Text::with_text_style("Control init...", Point::new(20, 20), style, text_style).draw(&mut display);
-    epd3in7
-        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
-        .expect("display error");
 
     control.init(clm).await;
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    let _ = Text::with_text_style("Config setup...", Point::new(20, 20), style, text_style).draw(&mut display);
+    let _ = Text::with_text_style("Connecting to WiFi...", Point::new(20, 20), style, text_style).draw(&mut display);
     epd3in7
         .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
         .expect("display error");

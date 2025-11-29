@@ -34,8 +34,7 @@ const WIFI_NETWORK: &str = "guest-01";
 const WIFI_PASSWORD: &str = "pickleswashere!";
 
 const SET_WIFI_MODE: &str = "AT+WMODE=3,1";
-const HTTP_REQUEST: &str =
-    "AT+HTTPCLIENTLINE=2,2,\"application/x-www-form-urlencoded\",\"rust-fluid.vercel.app\",443,\"/api/simple\"";
+const HTTP_REQUEST: &str = "AT+HTTPCLIENTLINE=2,2,\"application/json\",\"rust-fluid.vercel.app\",443,\"/api/simple\"";
 
 fn format_wifi_command(network: &str, password: &str) -> heapless::String<64> {
     let mut cmd = heapless::String::new();
@@ -88,10 +87,6 @@ async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) ->
         let _ = error_msg.push_str("Request Failed");
         return error_msg;
     }
-
-    // Wait for HTTP response - increased timeout for network request
-    Timer::after(Duration::from_millis(10000)).await;
-
     // Since we're using blocking UART, we'll try to read available data
     // The response should be available after the wait period
     let mut response_buffer = [0u8; 1024];

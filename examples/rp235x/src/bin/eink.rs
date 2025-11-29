@@ -161,6 +161,10 @@ async fn main(spawner: Spawner) {
         .expect("display error");
 
     // Network stack setup
+    // let mut dhcp_config = DhcpConfig::default();
+    // dhcp_config.hostname = Some("pico_rust".try_into().unwrap());
+    // let config = Config::dhcpv4(dhcp_config);
+
     let config = Config::dhcpv4(Default::default());
     let seed = rng.next_u64();
 

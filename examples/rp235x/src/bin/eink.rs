@@ -76,90 +76,116 @@ async fn send_at_command(uart: &mut Uart<'static, Blocking>, command: &str) -> b
 }
 
 async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) -> heapless::String<256> {
+    info!("Sending HTTP request: {}", command);
+
     // Send HTTP request command
     if uart.blocking_write(command.as_bytes()).is_err() {
         let mut error_msg = heapless::String::new();
-        let _ = error_msg.push_str("Request Failed");
+        let _ = error_msg.push_str("HTTP Write Failed");
         return error_msg;
     }
     if uart.blocking_write(b"\r\n").is_err() {
         let mut error_msg = heapless::String::new();
-        let _ = error_msg.push_str("Request Failed");
+        let _ = error_msg.push_str("HTTP Write Failed");
         return error_msg;
     }
-    // Since we're using blocking UART, we'll try to read available data
-    // The response should be available after the wait period
-    let mut response_buffer = [0u8; 1024];
+
+    // Wait longer for HTTP response - network requests take time
+    Timer::after(Duration::from_millis(1000)).await;
+
+    let mut response_buffer = [0u8; 2048];
+    let mut total_bytes = 0;
     let mut parsed_response = heapless::String::new();
 
-    // Try to read a single byte to see if data is available
-    // In a real implementation with buffered UART, we'd have better control
-    match uart.blocking_read(&mut response_buffer[..1]) {
-        Ok(_) => {
-            // We got at least one byte, try to read more
-            // Read in small chunks with timeout
-            let mut total_read = 1;
+    // Read response byte by byte with extended timeout
+    for attempt in 0..50 {
+        Timer::after(Duration::from_millis(200)).await;
 
-            // Try to read more data in chunks
-            for _ in 0..10 {
-                Timer::after(Duration::from_millis(100)).await;
-                let remaining_space = response_buffer.len() - total_read;
-                if remaining_space > 0 {
-                    // Try to read more bytes one at a time (blocking UART limitation)
-                    let chunk_size = core::cmp::min(32, remaining_space);
-                    match uart.blocking_read(&mut response_buffer[total_read..total_read + chunk_size]) {
-                        Ok(_) => {
-                            total_read += chunk_size;
-                        }
-                        Err(_) => break, // No more data or error
-                    }
-                }
-            }
-
-            // Parse the response
-            if let Ok(response_str) = core::str::from_utf8(&response_buffer[..total_read]) {
-                info!("Full response: {}", response_str);
-
-                // Look for the actual response body after "Response length:" header
-                if let Some(response_start) = response_str.find("Response length:") {
-                    // Find the actual response data
-                    if let Some(newline_pos) = response_str[response_start..].find('\n') {
-                        let data_start = response_start + newline_pos + 1;
-                        if data_start < response_str.len() {
-                            let response_body = &response_str[data_start..];
-                            // Find end of actual response (before "OK")
-                            let end_pos = response_body
-                                .find("\nOK")
-                                .unwrap_or(response_body.find("OK").unwrap_or(response_body.len()));
-                            let clean_response = response_body[..end_pos].trim();
-                            if !clean_response.is_empty() {
-                                let _ = parsed_response.push_str(clean_response);
-                            }
-                        }
-                    }
+        match uart.blocking_read(&mut response_buffer[total_bytes..total_bytes + 1]) {
+            Ok(_) => {
+                total_bytes += 1;
+                if total_bytes >= response_buffer.len() {
+                    break;
                 }
 
-                // If structured parsing failed, look for any meaningful content
-                if parsed_response.is_empty() {
-                    for line in response_str.lines() {
-                        let line = line.trim();
-                        if !line.is_empty()
-                            && !line.starts_with("AT+")
-                            && !line.starts_with("Response length:")
-                            && !line.contains("OK")
-                            && !line.contains("ERROR")
-                        {
-                            let _ = parsed_response.push_str(line);
+                // Check for complete response periodically
+                if total_bytes > 10 && total_bytes % 20 == 0 {
+                    if let Ok(current_str) = core::str::from_utf8(&response_buffer[..total_bytes]) {
+                        if current_str.contains("OK") || current_str.contains("ERROR") {
+                            // We might have a complete response
                             break;
                         }
                     }
                 }
             }
-        }
-        Err(_) => {
-            // No data available
+            Err(_) => {
+                // No data this attempt
+                if total_bytes > 0 && attempt > 20 {
+                    // We have some data and waited long enough
+                    break;
+                }
+            }
         }
     }
+
+    if total_bytes > 0 {
+        if let Ok(response_str) = core::str::from_utf8(&response_buffer[..total_bytes]) {
+            info!("HTTP response ({} bytes): {}", total_bytes, response_str);
+
+            // Parse AT+HTTPCLIENTLINE response format:
+            // Response length:<len>
+            // <actual_http_response>
+            // OK
+
+            if let Some(length_start) = response_str.find("Response length:") {
+                // Find the length value
+                if let Some(length_line_end) = response_str[length_start..].find('\n') {
+                    let length_line = &response_str[length_start..length_start + length_line_end];
+                    info!("Found response length line: {}", length_line);
+
+                    // Find the start of actual HTTP response data
+                    let data_start = length_start + length_line_end + 1;
+                    if data_start < response_str.len() {
+                        let response_data = &response_str[data_start..];
+
+                        // Find the end of response (before "OK")
+                        let end_marker = response_data
+                            .find("\nOK")
+                            .or_else(|| response_data.find("OK"))
+                            .unwrap_or(response_data.len());
+
+                        let http_body = response_data[..end_marker].trim();
+
+                        if !http_body.is_empty() {
+                            info!("Extracted HTTP body: {}", http_body);
+                            let _ = parsed_response.push_str(http_body);
+                        }
+                    }
+                }
+            }
+
+            // Fallback: look for any text that looks like our expected response
+            if parsed_response.is_empty() {
+                for line in response_str.lines() {
+                    let line = line.trim();
+                    if line.contains("hello world") || line.contains("api/simple") {
+                        let _ = parsed_response.push_str(line);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // If we still have nothing, return an error
+    if parsed_response.is_empty() {
+        if total_bytes == 0 {
+            let _ = parsed_response.push_str("No HTTP response");
+        } else {
+            let _ = parsed_response.push_str("Could not parse response");
+        }
+    }
+
     parsed_response
 }
 
@@ -288,4 +314,3 @@ async fn main(_spawner: Spawner) {
         Timer::after_millis(1000).await;
     }
 }
-

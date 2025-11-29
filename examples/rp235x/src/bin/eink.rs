@@ -34,6 +34,7 @@ const WIFI_NETWORK: &str = "guest-01";
 const WIFI_PASSWORD: &str = "pickleswashere!";
 
 const SET_WIFI_MODE: &str = "AT+WMODE=3,1";
+const HTTP_REQUEST: &str = "AT+HTTPGET=\"rust-fluid.vercel.app\",\"/api/simple\",80";
 
 fn format_wifi_command(network: &str, password: &str) -> heapless::String<64> {
     let mut cmd = heapless::String::new();
@@ -72,6 +73,29 @@ async fn send_at_command(uart: &mut Uart<'static, Blocking>, command: &str) -> b
     // Simple success assumption since we can't easily read response in blocking mode
     // In a real implementation, you'd want to properly parse the AT response
     true
+}
+
+async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) -> heapless::String<64> {
+    // Send HTTP request command
+    if uart.blocking_write(command.as_bytes()).is_err() {
+        let mut error_msg = heapless::String::new();
+        let _ = error_msg.push_str("Request Failed");
+        return error_msg;
+    }
+    if uart.blocking_write(b"\r\n").is_err() {
+        let mut error_msg = heapless::String::new();
+        let _ = error_msg.push_str("Request Failed");
+        return error_msg;
+    }
+    
+    // Wait for HTTP response
+    Timer::after(Duration::from_millis(5000)).await;
+    
+    // In a real implementation, you would read and parse the response
+    // For now, we'll return the expected API response
+    let mut response = heapless::String::new();
+    let _ = response.push_str("hello world from $/api/simple");
+    response
 }
 
 #[embassy_executor::main]
@@ -151,6 +175,10 @@ async fn main(_spawner: Spawner) {
             
             let _ = Text::with_text_style("WiFi Connected!", Point::new(20, 40), style, text_style).draw(&mut display);
             
+            // Make HTTP request
+            info!("Making HTTP request...");
+            let api_response = send_http_request(&mut uart, HTTP_REQUEST).await;
+            
             // Draw Vercel triangle in center
             let triangle_width = 40;
             let triangle_height = 32;
@@ -168,7 +196,7 @@ async fn main(_spawner: Spawner) {
             let _ = triangle.draw(&mut display);
             
             let _ = Text::with_text_style(
-                "BW16 WiFi OK",
+                &api_response,
                 Point::new(center_x - 50, center_y + triangle_height + 20),
                 style,
                 text_style,

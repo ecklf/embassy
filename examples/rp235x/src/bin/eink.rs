@@ -5,8 +5,8 @@ use core::cell::RefCell;
 use core::str::from_utf8;
 
 use cyw43::JoinOptions;
-use cyw43_pio::DEFAULT_CLOCK_DIVIDER;
 use cyw43_pio::PioSpi;
+use cyw43_pio::RM2_CLOCK_DIVIDER;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::text::Baseline;
 use embedded_graphics::text::Text;
@@ -83,6 +83,57 @@ async fn main(spawner: Spawner) {
     let fw = include_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
 
+    // E-ink display setup - using SPI1 with original pins
+    // Note: PIO SPI for WiFi is independent from hardware SPI1
+    let epd_rst_pin = p.PIN_12; // Reset pin
+    let epd_dc_pin = p.PIN_8; // Data/Command pin
+    let epd_busy_pin = p.PIN_13; // Busy status pin
+    let epd_cs_pin = p.PIN_9; // SPI Chip Select pin
+    let epd_clk_pin = p.PIN_10; // SPI Clock pin
+    let epd_mosi_pin = p.PIN_11; // SPI Master Out Slave In pin
+    let epd_miso_pin_dummy = p.PIN_28; // SPI Master In Slave Out pin
+
+    let cs_epd = Output::new(epd_cs_pin, Level::High);
+    let rst = Output::new(epd_rst_pin, Level::Low);
+    let dc = Output::new(epd_dc_pin, Level::Low);
+    let busy_in = gpio::Input::new(epd_busy_pin, gpio::Pull::None);
+    let mut delay = embassy_time::Delay;
+
+    let spi_cfg = spi::Config::default();
+    let spi = Spi::new(
+        p.SPI1,
+        epd_clk_pin,
+        epd_mosi_pin,
+        epd_miso_pin_dummy,
+        p.DMA_CH1, // Different DMA channel from WiFi
+        p.DMA_CH2, // Different DMA channel from WiFi
+        spi_cfg,
+    );
+
+    let spi_bus: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(spi));
+    let mut spi_dev = SpiDevice::new(&spi_bus, cs_epd);
+    let mut epd3in7 = EPD3in7::new(&mut spi_dev, busy_in, dc, rst, &mut delay, None).unwrap();
+    let mut display = Display3in7::default();
+
+    display.set_rotation(DisplayRotation::Rotate90);
+
+    // Build the style
+    let style = MonoTextStyleBuilder::new()
+        .font(&embedded_graphics::mono_font::ascii::FONT_7X14)
+        .text_color(Color::White)
+        .background_color(Color::Black)
+        .build();
+    let text_style = TextStyleBuilder::new()
+        .baseline(Baseline::Top)
+        // .alignment(embedded_graphics::text::Alignment::Center)
+        .alignment(embedded_graphics::text::Alignment::Left)
+        .build();
+
+    let _ = Text::with_text_style("Connecting to WiFi...", Point::new(20, 20), style, text_style).draw(&mut display);
+    epd3in7
+        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
+        .expect("display error");
+
     // WiFi setup
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs_wifi = Output::new(p.PIN_25, Level::High);
@@ -90,7 +141,7 @@ async fn main(spawner: Spawner) {
     let pio_spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
-        DEFAULT_CLOCK_DIVIDER,
+        RM2_CLOCK_DIVIDER,
         pio.irq0,
         cs_wifi,
         p.PIN_24,
@@ -98,15 +149,30 @@ async fn main(spawner: Spawner) {
         p.DMA_CH0,
     );
 
+    let _ = Text::with_text_style("Setup completed...", Point::new(20, 20), style, text_style).draw(&mut display);
+    epd3in7
+        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
+        .expect("display error");
+
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, pio_spi, fw).await;
     spawner.spawn(unwrap!(cyw43_task(runner)));
 
+    let _ = Text::with_text_style("Control init...", Point::new(20, 20), style, text_style).draw(&mut display);
+    epd3in7
+        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
+        .expect("display error");
+
     control.init(clm).await;
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
+
+    let _ = Text::with_text_style("Config setup...", Point::new(20, 20), style, text_style).draw(&mut display);
+    epd3in7
+        .update_and_display_frame(&mut spi_dev, display.buffer(), &mut delay)
+        .expect("display error");
 
     // Network stack setup
     let config = Config::dhcpv4(Default::default());
@@ -178,50 +244,6 @@ async fn main(spawner: Spawner) {
             let _ = response_text.push_str("HTTP Request Error");
         }
     }
-
-    // E-ink display setup - using SPI1 with original pins
-    // Note: PIO SPI for WiFi is independent from hardware SPI1
-    let epd_rst_pin = p.PIN_12; // Reset pin
-    let epd_dc_pin = p.PIN_8; // Data/Command pin
-    let epd_busy_pin = p.PIN_13; // Busy status pin
-    let epd_cs_pin = p.PIN_9; // SPI Chip Select pin
-    let epd_clk_pin = p.PIN_10; // SPI Clock pin
-    let epd_mosi_pin = p.PIN_11; // SPI Master Out Slave In pin
-    let epd_miso_pin_dummy = p.PIN_28; // SPI Master In Slave Out pin
-
-    let cs_epd = Output::new(epd_cs_pin, Level::High);
-    let rst = Output::new(epd_rst_pin, Level::Low);
-    let dc = Output::new(epd_dc_pin, Level::Low);
-    let busy_in = gpio::Input::new(epd_busy_pin, gpio::Pull::None);
-    let mut delay = embassy_time::Delay;
-
-    let spi_cfg = spi::Config::default();
-    let spi = Spi::new(
-        p.SPI1,
-        epd_clk_pin,
-        epd_mosi_pin,
-        epd_miso_pin_dummy,
-        p.DMA_CH1, // Different DMA channel from WiFi
-        p.DMA_CH2, // Different DMA channel from WiFi
-        spi_cfg,
-    );
-
-    let spi_bus: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(spi));
-    let mut spi_dev = SpiDevice::new(&spi_bus, cs_epd);
-    let mut epd3in7 = EPD3in7::new(&mut spi_dev, busy_in, dc, rst, &mut delay, None).unwrap();
-    let mut display = Display3in7::default();
-    display.set_rotation(DisplayRotation::Rotate90);
-
-    // Build the style
-    let style = MonoTextStyleBuilder::new()
-        .font(&embedded_graphics::mono_font::ascii::FONT_7X14)
-        .text_color(Color::White)
-        .background_color(Color::Black)
-        .build();
-    let text_style = TextStyleBuilder::new()
-        .baseline(Baseline::Top)
-        .alignment(embedded_graphics::text::Alignment::Center)
-        .build();
 
     // Draw Vercel triangle in center
     let triangle_width = 40;

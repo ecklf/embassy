@@ -10,14 +10,18 @@ use embedded_graphics::text::TextStyleBuilder;
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
 use embassy_rp::gpio;
-use embassy_rp::uart::{Blocking, Config as UartConfig, Uart};
-use embassy_time::{Duration, Timer};
+use embassy_rp::peripherals::UART1;
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_graphics::{
     prelude::*,
     primitives::{PrimitiveStyle, Triangle},
 };
+use embedded_io_async::{Read, Write};
 use heapless;
+use static_cell::StaticCell;
 
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 use embassy_sync::blocking_mutex::Mutex;
@@ -30,11 +34,16 @@ use epd_waveshare::{epd3in7::*, prelude::*};
 use gpio::{Level, Output};
 use {defmt_rtt as _, panic_probe as _};
 
+bind_interrupts!(struct Irqs {
+    UART1_IRQ => BufferedInterruptHandler<UART1>;
+});
+
 const WIFI_NETWORK: &str = "guest-01";
 const WIFI_PASSWORD: &str = "pickleswashere!";
 
 const SET_WIFI_MODE: &str = "AT+WMODE=3,1";
-const HTTP_REQUEST: &str = "AT+HTTPCLIENTLINE=2,2,\"application/json\",\"rust-fluid.vercel.app\",443,\"/api/simple\"";
+const HTTP_REQUEST: &str =
+    "AT+HTTPCLIENTLINE=2,2,\"application/json\",\"rust-fluid.vercel.app\",443,\"/api/json-example\"";
 
 fn format_wifi_command(network: &str, password: &str) -> heapless::String<64> {
     let mut cmd = heapless::String::new();
@@ -58,79 +67,158 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
     embassy_rp::binary_info::rp_program_build_attribute!(),
 ];
 
-async fn send_at_command(uart: &mut Uart<'static, Blocking>, command: &str) -> bool {
+async fn send_at_command_with_timeout(uart: &mut BufferedUart, command: &str, timeout_ms: u64) -> bool {
+    info!("Sending AT command: {}", command);
+
     // Send command
-    if uart.blocking_write(command.as_bytes()).is_err() {
+    if uart.write_all(command.as_bytes()).await.is_err() {
+        error!("Failed to write command");
         return false;
     }
-    if uart.blocking_write(b"\r\n").is_err() {
+    if uart.write_all(b"\r\n").await.is_err() {
+        error!("Failed to write CRLF");
         return false;
     }
 
-    // Wait a bit for response
-    Timer::after(Duration::from_millis(2000)).await;
+    // Wait for and read response
+    let mut response_buf = [0u8; 512];
+    let mut total_bytes = 0;
 
-    // Simple success assumption since we can't easily read response in blocking mode
-    // In a real implementation, you'd want to properly parse the AT response
-    true
+    // Read response with timeout
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    let read_result = with_timeout(timeout_duration, async {
+        loop {
+            let mut byte = [0u8; 1];
+            match uart.read(&mut byte).await {
+                Ok(1) => {
+                    if total_bytes < response_buf.len() {
+                        response_buf[total_bytes] = byte[0];
+                        total_bytes += 1;
+                    }
+                    // Check if we have a complete response
+                    if total_bytes >= 4 {
+                        let response = &response_buf[..total_bytes];
+                        if response.ends_with(b"OK\r\n") || response.ends_with(b"OK\n") {
+                            return true;
+                        }
+                        if response.ends_with(b"ERROR\r\n")
+                            || response.ends_with(b"ERROR\n")
+                            || response.ends_with(b"FAIL\r\n")
+                            || response.ends_with(b"FAIL\n")
+                        {
+                            return false;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Read error: {:?}", e);
+                    return false;
+                }
+            }
+        }
+    })
+    .await;
+
+    // Log what we received
+    if total_bytes > 0 {
+        if let Ok(s) = core::str::from_utf8(&response_buf[..total_bytes]) {
+            info!("AT response ({} bytes): {}", total_bytes, s);
+        } else {
+            info!("AT response ({} bytes, non-UTF8)", total_bytes);
+        }
+    } else {
+        info!("No response received");
+    }
+
+    match read_result {
+        Ok(success) => success,
+        Err(_) => {
+            // Timeout - check if we got any positive indication
+            if let Ok(s) = core::str::from_utf8(&response_buf[..total_bytes]) {
+                s.contains("OK")
+            } else {
+                false
+            }
+        }
+    }
 }
 
-async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) -> heapless::String<256> {
+async fn send_at_command(uart: &mut BufferedUart, command: &str) -> bool {
+    send_at_command_with_timeout(uart, command, 5000).await
+}
+
+async fn send_http_request(uart: &mut BufferedUart, command: &str) -> heapless::String<256> {
     info!("Sending HTTP request: {}", command);
 
     // Send HTTP request command
-    if uart.blocking_write(command.as_bytes()).is_err() {
+    if uart.write_all(command.as_bytes()).await.is_err() {
         let mut error_msg = heapless::String::new();
         let _ = error_msg.push_str("HTTP Write Failed");
         return error_msg;
     }
-    if uart.blocking_write(b"\r\n").is_err() {
+    if uart.write_all(b"\r\n").await.is_err() {
         let mut error_msg = heapless::String::new();
         let _ = error_msg.push_str("HTTP Write Failed");
         return error_msg;
     }
-
-    // Wait longer for HTTP response - network requests take time
-    Timer::after(Duration::from_millis(1000)).await;
 
     let mut response_buffer = [0u8; 2048];
     let mut total_bytes = 0;
     let mut parsed_response = heapless::String::new();
 
-    // Read response byte by byte with extended timeout
-    for attempt in 0..50 {
-        Timer::after(Duration::from_millis(200)).await;
+    // HTTP requests need longer timeout - network latency + TLS handshake
+    let timeout_duration = Duration::from_secs(15);
 
-        match uart.blocking_read(&mut response_buffer[total_bytes..total_bytes + 1]) {
-            Ok(_) => {
-                total_bytes += 1;
-                if total_bytes >= response_buffer.len() {
-                    break;
-                }
+    let read_result = with_timeout(timeout_duration, async {
+        // Small delay to let the module start processing
+        Timer::after(Duration::from_millis(100)).await;
 
-                // Check for complete response periodically
-                if total_bytes > 10 && total_bytes % 20 == 0 {
-                    if let Ok(current_str) = core::str::from_utf8(&response_buffer[..total_bytes]) {
-                        if current_str.contains("OK") || current_str.contains("ERROR") {
-                            // We might have a complete response
-                            break;
+        loop {
+            let mut byte = [0u8; 1];
+            match uart.read(&mut byte).await {
+                Ok(1) => {
+                    if total_bytes < response_buffer.len() {
+                        response_buffer[total_bytes] = byte[0];
+                        total_bytes += 1;
+                    }
+
+                    // Check for complete AT response
+                    if total_bytes >= 4 {
+                        let tail = &response_buffer[total_bytes.saturating_sub(6)..total_bytes];
+                        // Check for OK\r\n or ERROR\r\n endings
+                        if tail.ends_with(b"OK\r\n") || tail.ends_with(b"\nOK\n") {
+                            return true;
+                        }
+                        if tail.ends_with(b"ERROR\r\n") || tail.ends_with(b"ERROR\n") {
+                            return false;
                         }
                     }
                 }
-            }
-            Err(_) => {
-                // No data this attempt
-                if total_bytes > 0 && attempt > 20 {
-                    // We have some data and waited long enough
-                    break;
+                Ok(_) => {}
+                Err(e) => {
+                    info!("Read error: {:?}", e);
+                    return false;
                 }
             }
         }
-    }
+    })
+    .await;
+
+    let success = match read_result {
+        Ok(s) => s,
+        Err(_) => {
+            info!("HTTP request timed out after {} bytes", total_bytes);
+            false
+        }
+    };
 
     if total_bytes > 0 {
         if let Ok(response_str) = core::str::from_utf8(&response_buffer[..total_bytes]) {
-            info!("HTTP response ({} bytes): {}", total_bytes, response_str);
+            info!(
+                "HTTP response ({} bytes, success={}): {}",
+                total_bytes, success, response_str
+            );
 
             // Parse AT+HTTPCLIENTLINE response format:
             // Response length:<len>
@@ -150,8 +238,8 @@ async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) ->
 
                         // Find the end of response (before "OK")
                         let end_marker = response_data
-                            .find("\nOK")
-                            .or_else(|| response_data.find("OK"))
+                            .find("\r\nOK")
+                            .or_else(|| response_data.find("\nOK"))
                             .unwrap_or(response_data.len());
 
                         let http_body = response_data[..end_marker].trim();
@@ -164,7 +252,20 @@ async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) ->
                 }
             }
 
-            // Fallback: look for any text that looks like our expected response
+            // Fallback: look for JSON-like content or expected response patterns
+            if parsed_response.is_empty() {
+                // Try to find JSON object
+                if let Some(json_start) = response_str.find('{') {
+                    if let Some(json_end) = response_str.rfind('}') {
+                        if json_end > json_start {
+                            let json_str = &response_str[json_start..=json_end];
+                            let _ = parsed_response.push_str(json_str);
+                        }
+                    }
+                }
+            }
+
+            // Secondary fallback: look for known text patterns
             if parsed_response.is_empty() {
                 for line in response_str.lines() {
                     let line = line.trim();
@@ -182,7 +283,7 @@ async fn send_http_request(uart: &mut Uart<'static, Blocking>, command: &str) ->
         if total_bytes == 0 {
             let _ = parsed_response.push_str("No HTTP response");
         } else {
-            let _ = parsed_response.push_str("Could not parse response");
+            let _ = parsed_response.push_str("Parse failed");
         }
     }
 
@@ -238,8 +339,14 @@ async fn main(_spawner: Spawner) {
         .build();
 
     // Setup UART for BW16 communication (GP4=TX, GP5=RX)
+    // Using BufferedUart for proper async read/write
+    static TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    let tx_buf = &mut TX_BUF.init([0; 256])[..];
+    static RX_BUF: StaticCell<[u8; 2048]> = StaticCell::new();
+    let rx_buf = &mut RX_BUF.init([0; 2048])[..];
+
     let uart_config = UartConfig::default();
-    let mut uart = Uart::new_blocking(p.UART1, p.PIN_4, p.PIN_5, uart_config);
+    let mut uart = BufferedUart::new(p.UART1, p.PIN_4, p.PIN_5, Irqs, tx_buf, rx_buf, uart_config);
 
     let _ = Text::with_text_style("Initializing BW16...", Point::new(20, 20), style, text_style).draw(&mut display);
     epd3in7
@@ -247,22 +354,33 @@ async fn main(_spawner: Spawner) {
         .expect("display error");
 
     // Wait for BW16 to initialize
-    Timer::after(Duration::from_millis(5000)).await;
+    Timer::after(Duration::from_millis(3000)).await;
 
-    // Set WiFi mode
+    // First, send a simple AT command to check if the module is responding
+    info!("Testing BW16 communication...");
+    let at_test = send_at_command(&mut uart, "AT").await;
+    if !at_test {
+        error!("BW16 not responding to AT command");
+    }
+
+    // Set WiFi mode - use longer timeout
     info!("Setting WiFi mode...");
-    let wifi_mode_success = send_at_command(&mut uart, SET_WIFI_MODE).await;
+    let wifi_mode_success = send_at_command_with_timeout(&mut uart, SET_WIFI_MODE, 5000).await;
 
     if wifi_mode_success {
         info!("WiFi mode set successfully!");
 
-        // Connect to WiFi
+        // Connect to WiFi - this can take 10-20 seconds
         let wifi_command = format_wifi_command(WIFI_NETWORK, WIFI_PASSWORD);
-        info!("Connecting to WiFi...");
-        let wifi_connect_success = send_at_command(&mut uart, &wifi_command).await;
+        info!("Connecting to WiFi (this may take up to 20 seconds)...");
+        // WiFi connection needs a much longer timeout
+        let wifi_connect_success = send_at_command_with_timeout(&mut uart, &wifi_command, 20000).await;
 
         if wifi_connect_success {
             info!("WiFi connected successfully!");
+
+            // Give the module a moment to fully establish the connection
+            Timer::after(Duration::from_millis(2000)).await;
 
             let _ = Text::with_text_style("WiFi Connected!", Point::new(20, 40), style, text_style).draw(&mut display);
 

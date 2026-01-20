@@ -26,9 +26,10 @@ fixed = "1.23.1"
 fixed-macro = "1.2"
 
 
-reqwless = { version = "0.13.0", features = ["defmt"] }
-serde = { version = "1.0.203", default-features = false, features = ["derive"] }
-serde-json-core = "0.5.1"
+reqwless = { version = "0.13.0", features = ["defmt", "alloc"] }
+embedded-alloc = "0.6.0"
+serde = { version = "1.0.203", default-features = false, features = ["alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 
 # for assign resources example
 assign-resources = { git = "https://github.com/adamgreig/assign-resources", rev = "bd22cb7a92031fb16f74a5da42469d466c33383e" }

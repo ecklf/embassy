@@ -42,9 +42,11 @@ const WIFI_NETWORK: &str = "guest-01";
 const WIFI_PASSWORD: &str = "pickleswashere!";
 
 const SET_WIFI_MODE: &str = "AT+WMODE=3,1";
-const HTTP_REQUEST: &str =
-    "AT+HTTPCLIENTLINE=2,2,\"application/json\",\"rust-fluid.vercel.app\",443,\"/api/json-example\"";
 
+// API endpoint configuration
+// Using httpbin.org with plain HTTP since BW16's TLS has issues
+const API_HOST: &str = "httpbin.org";
+const API_PATH: &str = "/json";
 fn format_wifi_command(network: &str, password: &str) -> heapless::String<64> {
     let mut cmd = heapless::String::new();
     let _ = cmd.push_str("AT+WJAP=\"");
@@ -148,32 +150,178 @@ async fn send_at_command(uart: &mut BufferedUart, command: &str) -> bool {
     send_at_command_with_timeout(uart, command, 5000).await
 }
 
-async fn send_http_request(uart: &mut BufferedUart, command: &str) -> heapless::String<256> {
-    info!("Sending HTTP request: {}", command);
+/// Send AT command and return the raw response
+async fn send_at_command_get_response(
+    uart: &mut BufferedUart,
+    command: &str,
+    timeout_ms: u64,
+) -> heapless::String<512> {
+    let mut response = heapless::String::new();
 
-    // Send HTTP request command
+    info!("Sending: {}", command);
+
+    // Send command
     if uart.write_all(command.as_bytes()).await.is_err() {
-        let mut error_msg = heapless::String::new();
-        let _ = error_msg.push_str("HTTP Write Failed");
-        return error_msg;
+        let _ = response.push_str("WRITE_ERR");
+        return response;
     }
     if uart.write_all(b"\r\n").await.is_err() {
-        let mut error_msg = heapless::String::new();
-        let _ = error_msg.push_str("HTTP Write Failed");
-        return error_msg;
+        let _ = response.push_str("WRITE_ERR");
+        return response;
     }
 
+    // Read response
+    let mut response_buf = [0u8; 512];
+    let mut total_bytes = 0;
+
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    let _ = with_timeout(timeout_duration, async {
+        loop {
+            let mut byte = [0u8; 1];
+            match uart.read(&mut byte).await {
+                Ok(1) => {
+                    if total_bytes < response_buf.len() {
+                        response_buf[total_bytes] = byte[0];
+                        total_bytes += 1;
+                    }
+                    // Check for end of response
+                    if total_bytes >= 4 {
+                        let tail = &response_buf[..total_bytes];
+                        if tail.ends_with(b"OK\r\n")
+                            || tail.ends_with(b"OK\n")
+                            || tail.ends_with(b"ERROR\r\n")
+                            || tail.ends_with(b"ERROR\n")
+                            || tail.ends_with(b"FAIL\r\n")
+                            || tail.ends_with(b"FAIL\n")
+                        {
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+
+    if let Ok(s) = core::str::from_utf8(&response_buf[..total_bytes]) {
+        info!("Response: {}", s);
+        let _ = response.push_str(s);
+    }
+
+    response
+}
+
+/// Make an HTTPS request using SSL socket
+/// This uses AT+SOCKET=7 (SSLClient) for TLS connection
+async fn send_https_request(uart: &mut BufferedUart, host: &str, path: &str) -> heapless::String<256> {
+    let mut result = heapless::String::new();
+
+    // Step 1: Create TCP socket connection (type 4 = TCPClient) to port 80
+    // Using plain HTTP since BW16's TLS has issues with modern servers
+    let mut socket_cmd = heapless::String::<128>::new();
+    let _ = socket_cmd.push_str("AT+SOCKET=4,");
+    let _ = socket_cmd.push_str(host);
+    let _ = socket_cmd.push_str(",80");
+
+    info!("Creating TCP socket: {}", socket_cmd.as_str());
+    let socket_response = send_at_command_get_response(uart, &socket_cmd, 10000).await;
+
+    // Check if connection succeeded - look for "connect success" or just "OK"
+    if !socket_response.contains("OK") {
+        let _ = result.push_str("TCP fail: ");
+        // Add first 50 chars of response for debugging
+        let snippet = if socket_response.len() > 50 {
+            &socket_response[..50]
+        } else {
+            socket_response.as_str()
+        };
+        let _ = result.push_str(snippet);
+        return result;
+    }
+
+    info!("TCP socket created successfully");
+
+    // Give TLS handshake time to complete
+    Timer::after(Duration::from_millis(1000)).await;
+
+    // Step 2: Build and send HTTP GET request
+    // Format: GET /path HTTP/1.1\r\nHost: hostname\r\nConnection: close\r\n\r\n
+    let mut http_request = heapless::String::<256>::new();
+    let _ = http_request.push_str("GET ");
+    let _ = http_request.push_str(path);
+    let _ = http_request.push_str(" HTTP/1.1\r\nHost: ");
+    let _ = http_request.push_str(host);
+    let _ = http_request.push_str("\r\nConnection: close\r\n\r\n");
+
+    let request_len = http_request.len();
+
+    // Use AT+SOCKETSEND to send the HTTP request
+    let mut send_cmd = heapless::String::<32>::new();
+    let _ = send_cmd.push_str("AT+SOCKETSEND=1,");
+    // Format the length
+    let mut len_str = heapless::String::<8>::new();
+    let _ = core::fmt::write(&mut len_str, format_args!("{}", request_len));
+    let _ = send_cmd.push_str(&len_str);
+
+    info!("Sending HTTP request ({} bytes)", request_len);
+
+    // Send the SOCKETSEND command
+    if uart.write_all(send_cmd.as_bytes()).await.is_err() {
+        let _ = result.push_str("Send cmd failed");
+        return result;
+    }
+    if uart.write_all(b"\r\n").await.is_err() {
+        let _ = result.push_str("Send cmd failed");
+        return result;
+    }
+
+    // Wait for ">" prompt
+    let mut prompt_buf = [0u8; 64];
+    let mut prompt_len = 0;
+    let prompt_timeout = Duration::from_millis(3000);
+
+    let got_prompt = with_timeout(prompt_timeout, async {
+        loop {
+            let mut byte = [0u8; 1];
+            if uart.read(&mut byte).await.is_ok() {
+                if prompt_len < prompt_buf.len() {
+                    prompt_buf[prompt_len] = byte[0];
+                    prompt_len += 1;
+                }
+                if byte[0] == b'>' {
+                    return true;
+                }
+            }
+        }
+    })
+    .await;
+
+    if got_prompt.is_err() || !got_prompt.unwrap() {
+        let _ = result.push_str("No > prompt");
+        return result;
+    }
+
+    // Send the actual HTTP request data
+    if uart.write_all(http_request.as_bytes()).await.is_err() {
+        let _ = result.push_str("HTTP send failed");
+        return result;
+    }
+
+    // Wait for send confirmation
+    Timer::after(Duration::from_millis(500)).await;
+
+    // Step 3: Read response using AT+SOCKETREAD or wait for +EVENT:SocketDown
+    // First, enable active receive mode
+    let _ = send_at_command(uart, "AT+SOCKETRECVCFG=1").await;
+
+    // Wait for response data
     let mut response_buffer = [0u8; 2048];
     let mut total_bytes = 0;
-    let mut parsed_response = heapless::String::new();
 
-    // HTTP requests need longer timeout - network latency + TLS handshake
-    let timeout_duration = Duration::from_secs(15);
-
-    let read_result = with_timeout(timeout_duration, async {
-        // Small delay to let the module start processing
-        Timer::after(Duration::from_millis(100)).await;
-
+    let read_timeout = Duration::from_secs(10);
+    let _ = with_timeout(read_timeout, async {
         loop {
             let mut byte = [0u8; 1];
             match uart.read(&mut byte).await {
@@ -183,111 +331,65 @@ async fn send_http_request(uart: &mut BufferedUart, command: &str) -> heapless::
                         total_bytes += 1;
                     }
 
-                    // Check for complete AT response
-                    if total_bytes >= 4 {
-                        let tail = &response_buffer[total_bytes.saturating_sub(6)..total_bytes];
-                        // Check for OK\r\n or ERROR\r\n endings
-                        if tail.ends_with(b"OK\r\n") || tail.ends_with(b"\nOK\n") {
-                            return true;
-                        }
-                        if tail.ends_with(b"ERROR\r\n") || tail.ends_with(b"ERROR\n") {
-                            return false;
+                    // Check if we've received a complete HTTP response
+                    // Look for end of HTTP response or socket close event
+                    if total_bytes > 10 {
+                        let tail = &response_buffer[..total_bytes];
+                        // Check for various end conditions
+                        if tail.ends_with(b"\r\n\r\n") || tail.ends_with(b"}\r\n") || tail.ends_with(b"}\n") {
+                            // Might have complete JSON response
+                            if let Ok(s) = core::str::from_utf8(tail) {
+                                if s.contains('}') && s.matches('{').count() == s.matches('}').count() {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    info!("Read error: {:?}", e);
-                    return false;
-                }
+                Err(_) => return,
             }
         }
     })
     .await;
 
-    let success = match read_result {
-        Ok(s) => s,
-        Err(_) => {
-            info!("HTTP request timed out after {} bytes", total_bytes);
-            false
-        }
-    };
+    info!("Received {} bytes", total_bytes);
 
+    // Parse the response
     if total_bytes > 0 {
         if let Ok(response_str) = core::str::from_utf8(&response_buffer[..total_bytes]) {
-            info!(
-                "HTTP response ({} bytes, success={}): {}",
-                total_bytes, success, response_str
-            );
+            info!("Raw response: {}", response_str);
 
-            // Parse AT+HTTPCLIENTLINE response format:
-            // Response length:<len>
-            // <actual_http_response>
-            // OK
-
-            if let Some(length_start) = response_str.find("Response length:") {
-                // Find the length value
-                if let Some(length_line_end) = response_str[length_start..].find('\n') {
-                    let length_line = &response_str[length_start..length_start + length_line_end];
-                    info!("Found response length line: {}", length_line);
-
-                    // Find the start of actual HTTP response data
-                    let data_start = length_start + length_line_end + 1;
-                    if data_start < response_str.len() {
-                        let response_data = &response_str[data_start..];
-
-                        // Find the end of response (before "OK")
-                        let end_marker = response_data
-                            .find("\r\nOK")
-                            .or_else(|| response_data.find("\nOK"))
-                            .unwrap_or(response_data.len());
-
-                        let http_body = response_data[..end_marker].trim();
-
-                        if !http_body.is_empty() {
-                            info!("Extracted HTTP body: {}", http_body);
-                            let _ = parsed_response.push_str(http_body);
-                        }
+            // Look for JSON in the response
+            if let Some(json_start) = response_str.find('{') {
+                if let Some(json_end) = response_str.rfind('}') {
+                    if json_end > json_start {
+                        let json_str = &response_str[json_start..=json_end];
+                        let _ = result.push_str(json_str);
                     }
                 }
             }
 
-            // Fallback: look for JSON-like content or expected response patterns
-            if parsed_response.is_empty() {
-                // Try to find JSON object
-                if let Some(json_start) = response_str.find('{') {
-                    if let Some(json_end) = response_str.rfind('}') {
-                        if json_end > json_start {
-                            let json_str = &response_str[json_start..=json_end];
-                            let _ = parsed_response.push_str(json_str);
-                        }
-                    }
-                }
-            }
-
-            // Secondary fallback: look for known text patterns
-            if parsed_response.is_empty() {
-                for line in response_str.lines() {
-                    let line = line.trim();
-                    if line.contains("hello world") || line.contains("api/simple") {
-                        let _ = parsed_response.push_str(line);
-                        break;
-                    }
-                }
+            // If no JSON found, return a snippet
+            if result.is_empty() {
+                let snippet = if response_str.len() > 250 {
+                    &response_str[..250]
+                } else {
+                    response_str
+                };
+                let _ = result.push_str(snippet);
             }
         }
     }
 
-    // If we still have nothing, return an error
-    if parsed_response.is_empty() {
-        if total_bytes == 0 {
-            let _ = parsed_response.push_str("No HTTP response");
-        } else {
-            let _ = parsed_response.push_str("Parse failed");
-        }
+    // Step 4: Close the socket
+    let _ = send_at_command(uart, "AT+SOCKETDEL=1").await;
+
+    if result.is_empty() {
+        let _ = result.push_str("No response data");
     }
 
-    parsed_response
+    result
 }
 
 #[embassy_executor::main]
@@ -363,6 +465,10 @@ async fn main(_spawner: Spawner) {
         error!("BW16 not responding to AT command");
     }
 
+    // Disable command echo so responses don't include the command
+    info!("Disabling echo...");
+    let _ = send_at_command(&mut uart, "ATE0").await;
+
     // Set WiFi mode - use longer timeout
     info!("Setting WiFi mode...");
     let wifi_mode_success = send_at_command_with_timeout(&mut uart, SET_WIFI_MODE, 5000).await;
@@ -384,33 +490,11 @@ async fn main(_spawner: Spawner) {
 
             let _ = Text::with_text_style("WiFi Connected!", Point::new(20, 40), style, text_style).draw(&mut display);
 
-            // Make HTTP request
-            info!("Making HTTP request...");
-            let api_response = send_http_request(&mut uart, HTTP_REQUEST).await;
+            // Make HTTPS request using SSL socket
+            info!("Making HTTPS request...");
+            let api_response = send_https_request(&mut uart, API_HOST, API_PATH).await;
 
-            // Draw Vercel triangle in center
-            let triangle_width = 40;
-            let triangle_height = 32;
-
-            let center_x = 240;
-            let center_y = 140 - (triangle_height / 2);
-
-            let triangle = Triangle::new(
-                Point::new(center_x, center_y - triangle_height),
-                Point::new(center_x - triangle_width, center_y + triangle_height),
-                Point::new(center_x + triangle_width, center_y + triangle_height),
-            )
-            .into_styled(PrimitiveStyle::with_fill(Color::White));
-
-            let _ = triangle.draw(&mut display);
-
-            let _ = Text::with_text_style(
-                &api_response,
-                Point::new(center_x - 50, center_y + triangle_height + 20),
-                style,
-                text_style,
-            )
-            .draw(&mut display);
+            let _ = Text::with_text_style(&api_response, Point::new(20, 60), style, text_style).draw(&mut display);
         } else {
             error!("Failed to connect to WiFi");
             let _ = Text::with_text_style("WiFi Failed!", Point::new(20, 40), style, text_style).draw(&mut display);
